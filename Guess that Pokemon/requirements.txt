@@ -1,0 +1,8 @@
+beautifulsoup4
+requests
+pillow
+pygame
+numpy
+opencv-python
+pyserial
+pyinstaller

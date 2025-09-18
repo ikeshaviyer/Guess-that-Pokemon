@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 from bs4 import BeautifulSoup
 import requests
@@ -19,27 +20,30 @@ def find_arduino_port():
     global arduino
     global arduino_connected
     
-    ports = list(serial.tools.list_ports.comports())
-    print("Available ports:")
-    for port in ports:
-        print(f"{port.device}: {port.description}")
-        
-        try:
-            # Check if port description contains "Arduino"
-            if "Arduino" in port.description:
-                print(f"Arduino found on {port.device}")
-                time.sleep(2)  # Small delay before trying to open the port
-                try:
-                    arduino = serial.Serial(port.device, 9600, timeout=1)
-                    arduino_connected = True
-                    print(f"Successfully connected to {port.device}")
-                    return
-                except Exception as e:
-                    print(f"Failed to connect to {port.device}: {e}")
-                    continue
-        except Exception as e:
-            print(f"Error while checking {port.device}: {e}")
-            continue
+    try:
+        ports = list(serial.tools.list_ports.comports())
+        print("Available ports:")
+        for port in ports:
+            print(f"{port.device}: {port.description}")
+            
+            try:
+                # Check if port description contains "Arduino"
+                if "Arduino" in port.description:
+                    print(f"Arduino found on {port.device}")
+                    time.sleep(2)  # Small delay before trying to open the port
+                    try:
+                        arduino = serial.Serial(port.device, 9600, timeout=1)
+                        arduino_connected = True
+                        print(f"Successfully connected to {port.device}")
+                        return
+                    except Exception as e:
+                        print(f"Failed to connect to {port.device}: {e}")
+                        continue
+            except Exception as e:
+                print(f"Error while checking {port.device}: {e}")
+                continue
+    except Exception as e:
+        print(f"Error scanning for Arduino ports: {e}")
     
     arduino_connected = False
     print("No Arduino found.")
@@ -233,7 +237,7 @@ def play_screen():
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
-                exit()
+                sys.exit()
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_RETURN:
                     waiting = False
@@ -257,7 +261,7 @@ def game_over_screen(points):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
-                exit()
+                sys.exit()
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_RETURN:
                     waiting = False
@@ -282,7 +286,7 @@ def you_win_screen(points, total_rounds):
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 pygame.quit()
-                exit()
+                sys.exit()
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_RETURN:
                     waiting = False
@@ -290,9 +294,18 @@ def you_win_screen(points, total_rounds):
 
 def send_high():
     if arduino_connected:
-        arduino.write(b'H')  # Send 'H' to Arduino
-        time.sleep(3)         # Wait for 3 seconds
-        arduino.write(b'L')  # Send 'L' to Arduino
+        try:
+            arduino.write(b'H')  # Send 'H' to Arduino
+            # Don't block the game - Arduino will handle timing
+        except Exception as e:
+            print(f"Arduino communication error: {e}")
+
+def send_low():
+    if arduino_connected:
+        try:
+            arduino.write(b'L')  # Send 'L' to Arduino
+        except Exception as e:
+            print(f"Arduino communication error: {e}")
 
 def handle_incorrect_guess(pokemon_img, pokemon_name):
     display_actual_image_with_fade(pokemon_img)
@@ -308,9 +321,15 @@ def main_game():
     points = 0
     total_rounds = 10
     current_round = 1
+    
+    # Game state variables
+    game_state = "guessing"  # "guessing", "showing_result", "transitioning"
+    transition_start_time = 0
+    arduino_signal_sent = False
+    arduino_low_sent = False
 
     # Timer related variables
-    time_limit = 5  # 30 seconds limit per round
+    time_limit = 5  # 5 seconds limit per round
     start_time = time.time()
 
     # Fetch Pokémon data
@@ -323,93 +342,136 @@ def main_game():
 
     bg_frames = load_gif_frames(background_gif_path)
     frame_index = 0
+    
+    # Clear any existing events in the queue
+    pygame.event.clear()
 
     while running:
         frame_index = display_background(bg_frames, frame_index)
-        display_silhouette(silhouette)
-
-        # Calculate remaining time and check if time is up
-        elapsed_time = time.time() - start_time
-        if elapsed_time > time_limit:
-            result_text = f"Time's Up! It was {pokemon_name.title()}"
-            handle_incorrect_guess(pokemon_img, pokemon_name)
-            current_round += 1
-            if current_round <= total_rounds:
-                pokemon_name, pokemon_img_url = random.choice(pokemon_data)
-                pokemon_img = fetch_pokemon_image(pokemon_img_url)
-                silhouette = create_silhouette(pokemon_img)
-                start_time = time.time()
-                result_text = ""
+        
+        # Handle different game states
+        if game_state == "guessing":
+            display_silhouette(silhouette)
+            
+            # Calculate remaining time and check if time is up
+            elapsed_time = time.time() - start_time
+            if elapsed_time > time_limit:
+                result_text = f"Time's Up! It was {pokemon_name.title()}"
+                game_state = "showing_result"
+                transition_start_time = time.time()
+                arduino_signal_sent = False  # Reset Arduino signal flags
+                arduino_low_sent = False
+                # Clear input buffer when transitioning
+                pygame.event.clear()
                 user_text = ""
-            else:
-                running = False
-                you_win_screen(points, total_rounds)
+                
+        elif game_state == "showing_result":
+            # Show the result - display image and name without fade (static display)
+            pil_image = pokemon_img.convert("RGBA")
+            mode = pil_image.mode
+            size = pil_image.size
+            data = pil_image.tobytes()
+            surface = pygame.image.fromstring(data, size, mode)
+            surface_rect = surface.get_rect(center=(bg_width // 2, bg_height // 2))
+            screen.blit(surface, surface_rect.topleft)
+            display_pokemon_name(pokemon_name)
+            
+            # Send Arduino signal only for incorrect answers (not for correct answers)
+            if not arduino_signal_sent and result_text != "Correct!":
+                send_high()
+                arduino_signal_sent = True
+            
+            # Send LOW signal after 2.5 seconds to turn off Arduino signal (only if HIGH was sent)
+            if not arduino_low_sent and arduino_signal_sent and time.time() - transition_start_time > 2.5:
+                send_low()
+                arduino_low_sent = True
+            
+            # Wait for transition period
+            if time.time() - transition_start_time > 3.0:  # Show result for 3 seconds
+                game_state = "transitioning"
+                transition_start_time = time.time()
+                
+        elif game_state == "transitioning":
+            # Brief transition period to prevent input carryover
+            if time.time() - transition_start_time > 0.5:  # 0.5 second buffer
+                current_round += 1
+                if current_round <= total_rounds:
+                    # Start new round
+                    pokemon_name, pokemon_img_url = random.choice(pokemon_data)
+                    pokemon_img = fetch_pokemon_image(pokemon_img_url)
+                    silhouette = create_silhouette(pokemon_img)
+                    start_time = time.time()
+                    result_text = ""
+                    user_text = ""
+                    game_state = "guessing"
+                    arduino_signal_sent = False  # Reset Arduino signal flags
+                    arduino_low_sent = False
+                    # Clear any accumulated events
+                    pygame.event.clear()
+                else:
+                    running = False
+                    you_win_screen(points, total_rounds)
 
-        # Draw the text box and other UI elements over the background and silhouette
-        draw_textbox(user_text)
+        # Draw the text box only during guessing state
+        if game_state == "guessing":
+            draw_textbox(user_text)
 
-        # Display the result of the guess and points
-        result_surface = font.render(result_text, True, BLACK[:3])
-        screen.blit(result_surface, (bg_width // 2 - (result_surface.get_width() // 2), bg_height - 130))  # Adjust placement as necessary
+        # Display the result of the guess in the upper part of the screen
+        if result_text:
+            result_surface = font.render(result_text, True, BLACK[:3])
+            screen.blit(result_surface, (bg_width // 2 - (result_surface.get_width() // 2), 150))  # Upper part of screen
 
         points_surface = font.render(f"Points: {points}", True, BLACK[:3])
         screen.blit(points_surface, (100, 50))
         round_surface = font.render(f"Round: {current_round} / {total_rounds}", True, BLACK[:3])
         screen.blit(round_surface, (bg_width - 200, 50))
 
-        # Display the countdown timer
-        remaining_time = max(0, time_limit - elapsed_time)
-        timer_surface = font.render(f"Time: {remaining_time:.1f}s", True, BLACK[:3])
-        screen.blit(timer_surface, (20, bg_height - 50))
+        # Display the countdown timer (only during guessing)
+        if game_state == "guessing":
+            elapsed_time = time.time() - start_time
+            remaining_time = max(0, time_limit - elapsed_time)
+            timer_surface = font.render(f"Time: {remaining_time:.1f}s", True, BLACK[:3])
+            screen.blit(timer_surface, (20, bg_height - 50))
 
         # Event handling
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_RETURN:
-                    if user_text.lower() == pokemon_name:
-                        points += 1
-                        result_text = "Correct!"
-                        correct_sound.play()  # Play correct sound
-                        display_pokemon_name(pokemon_name)
-                        display_actual_image_with_fade(pokemon_img)
-                        pygame.display.flip()
-                        pygame.time.wait(2000)
-                        current_round += 1
-                        if current_round <= total_rounds:
-                            # Choose a new Pokémon
-                            pokemon_name, pokemon_img_url = random.choice(pokemon_data)
-                            pokemon_img = fetch_pokemon_image(pokemon_img_url)
-                            silhouette = create_silhouette(pokemon_img)
-                            start_time = time.time()  # Reset the timer
-                            user_text = ""
+                # Only process input during guessing state
+                if game_state == "guessing":
+                    if event.key == pygame.K_RETURN:
+                        if user_text.lower() == pokemon_name:
+                            points += 1
+                            result_text = "Correct!"
+                            correct_sound.play()  # Play correct sound
+                            game_state = "showing_result"
+                            transition_start_time = time.time()
+                            arduino_signal_sent = False  # Reset Arduino signal flags
+                            arduino_low_sent = False
+                            # Clear input buffer when transitioning
+                            pygame.event.clear()
                         else:
-                            running = False
-                            you_win_screen(points, total_rounds)
-                        result_text = ""
+                            result_text = f"It was {pokemon_name.title()}"
+                            incorrect_sound.play()  # Play incorrect sound
+                            game_state = "showing_result"
+                            transition_start_time = time.time()
+                            arduino_signal_sent = False  # Reset Arduino signal flags
+                            arduino_low_sent = False
+                            # Clear input buffer when transitioning
+                            pygame.event.clear()
+                            user_text = ""
+                    elif event.key == pygame.K_BACKSPACE:
+                        user_text = user_text[:-1]
+                    elif event.key == pygame.K_ESCAPE:
+                        game_over_screen(points)
                     else:
-                        result_text = f"It was {pokemon_name.title()}"
-                        incorrect_sound.play()  # Play incorrect sound
-                        handle_incorrect_guess(pokemon_img, pokemon_name)
-                        current_round += 1
-                        if current_round <= total_rounds:
-                            # Choose a new Pokémon
-                            pokemon_name, pokemon_img_url = random.choice(pokemon_data)
-                            pokemon_img = fetch_pokemon_image(pokemon_img_url)
-                            silhouette = create_silhouette(pokemon_img)
-                            start_time = time.time()  # Reset the timer
-                            user_text = ""
-                        else:
-                            running = False
-                            you_win_screen(points, total_rounds)
-                        result_text = ""
-                elif event.key == pygame.K_BACKSPACE:
-                    user_text = user_text[:-1]
+                        # Only add printable characters
+                        if event.unicode.isprintable() and len(user_text) < 20:
+                            user_text += event.unicode
+                # Allow escape to work in any state
                 elif event.key == pygame.K_ESCAPE:
                     game_over_screen(points)
-                else:
-                    user_text += event.unicode
 
         pygame.display.flip()
 
